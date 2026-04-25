@@ -6,8 +6,8 @@ import { config } from "./config";
 import { join, resolve } from "node:path";
 
 // hardcoded parameters
-export const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB chunks
-export const MIN_CHUNK_SAVE_INTERVAL = 1 * 1000; // 10 seconds
+export const CHUNK_SIZE = 1024 * 1024; // 1MB chunks
+export const MIN_CHUNK_SAVE_INTERVAL = 5 * 1000; // 5 seconds
 
 export class File {
   private file: number;
@@ -67,8 +67,16 @@ export class File {
     }
 
     if (mediaSource.chunks && fs.existsSync(file.path + ".progress")) {
+      // buffer
+      const buffer = Buffer.from(mediaSource.chunks);
+
+      // DEBUG: randomly void one byte
+      const first = Math.floor(4 + Math.random() * buffer.length);
+      buffer[first] = 0;
+
       // load in-progress file
-      file.chunks = BitArray.fromBuffer(Buffer.from(mediaSource.chunks));
+      file.chunks = BitArray.fromBuffer(buffer);
+
       file.pending = new Map();
       file.file = fs.openSync(file.path + ".progress", "r+");
       file.fileSize = fs.fstatSync(file.file).size;
@@ -213,7 +221,7 @@ export class File {
     const pending = this.pending;
 
     return {
-      resolve: (buffer: Buffer) => {
+      resolve: (buffer: Buffer, forceWriteChunks = false) => {
         const position = index * CHUNK_SIZE;
         const expectedSize = Math.min(CHUNK_SIZE, this.fileSize - position);
 
@@ -256,11 +264,9 @@ export class File {
                 // finalize the file because all chunks are written to disk
                 this.#finalize();
               } else if (
-                this.lastChunkSaveTime >= 0 &&
+                forceWriteChunks ||
                 Date.now() - this.lastChunkSaveTime > MIN_CHUNK_SAVE_INTERVAL
               ) {
-                // block chunk map save while the file is saving
-                this.lastChunkSaveTime = -1;
                 this.writeChunkState();
                 this.lastChunkSaveTime = Date.now();
               }

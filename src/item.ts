@@ -113,7 +113,7 @@ const stmtHasMediaSource = DB.prepare<MediaSource, [string]>(
   `SELECT mediaSourceId FROM mediaSources WHERE mediaSourceId = ?;`,
 );
 
-const stmtUpdateChunks = DB.prepare<void, [string, Buffer | null]>(
+const stmtUpdateChunks = DB.prepare<void, [Buffer | null, string]>(
   `UPDATE mediaSources SET chunks = ? WHERE mediaSourceId = ?;`,
 );
 
@@ -131,7 +131,7 @@ export function touchMediaSource(mediaSourceId: string) {
 
 export function updateChunks(mediaSourceId: string, chunk: Buffer | null) {
   console.log("updateChunks", chunk);
-  stmtUpdateChunks.run(mediaSourceId, chunk);
+  stmtUpdateChunks.run(chunk, mediaSourceId);
 }
 
 export function insertMediaSource(

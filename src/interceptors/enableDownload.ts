@@ -58,10 +58,10 @@ export const enableDownload: Interceptor = {
       apiKey,
     );
 
-    return new Response(session.read(startByte), {
+    return new Response(session.read(startByte, ctx.request.signal), {
       status: 206,
       headers: {
-        "content-type": `video/${session.mediaSource.container.toLowerCase()}`,
+        "content-type": `application/octet-stream`,
         "cache-control": "private, no-transform",
         "content-length": session.mediaSource.size.toString(),
         "content-range": `bytes ${startByte}-${session.mediaSource.size - 1}/${session.mediaSource.size}`,

@@ -4,8 +4,8 @@ import { mkdirSync } from "node:fs";
 export const config = {
   upstream: {
     // DO NOT USE THIS URL
-    // url: process.env.UPSTREAM_URL || "http://110.42.42.172:29530",
-    url: process.env.UPSTREAM_URL || "https://ping-mike.exe.xyz",
+    url: process.env.UPSTREAM_URL || "http://110.42.42.172:29530",
+    // url: process.env.UPSTREAM_URL || "https://ping-mike.exe.xyz",
   },
   server: {
     port: parseInt(process.env.PORT || "3000", 10),
