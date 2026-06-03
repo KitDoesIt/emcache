@@ -90,7 +90,7 @@ func (s StreamCache) OnRequest(ctx *Context) (*http.Response, bool, error) {
 	response.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, handle.Source.Size))
 	response.Header.Set("Content-Type", contentTypeForContainer(matches[2]))
 
-	fmt.Printf("[StreamCache] active mediaSource=%s range=%d-%d/%d\n", mediaSourceID, start, end, handle.Source.Size)
+	fmt.Printf("[StreamCache] active mediaSource=%s range=%d-%d/%d startChunk=%d pending=%d\n", mediaSourceID, start, end, handle.Source.Size, start/cache.ChunkSize, handle.File.PendingCount())
 	return response, true, nil
 }
 

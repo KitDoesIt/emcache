@@ -68,15 +68,54 @@ func OpenCachedFile(ctx context.Context, storagePath string, source store.MediaS
 			finalized:    true,
 		}, nil
 	}
+	if info, err := os.Stat(path); err == nil && info.Size() != source.Size {
+		_ = os.Remove(path)
+	}
 
 	chunks := NewBitset(chunkCount)
-	if len(source.Chunks) > 0 {
+	progressInfo, progressErr := os.Stat(progressPath)
+	progressExists := progressErr == nil && progressInfo.Size() == source.Size
+	if progressErr == nil && progressInfo.Size() != source.Size {
+		_ = os.Remove(progressPath)
+		progressExists = false
+	}
+
+	if progressExists && len(source.Chunks) > 0 {
 		decoded, err := BitsetFromBytes(source.Chunks)
 		if err == nil && decoded.Size() == chunkCount {
 			chunks = decoded
+			if chunks.Complete() {
+				file, err := os.OpenFile(progressPath, os.O_RDWR, 0)
+				if err != nil {
+					return nil, err
+				}
+				cached := &CachedFile{
+					path:         path,
+					progressPath: progressPath,
+					file:         file,
+					source:       source,
+					chunks:       chunks,
+					store:        store,
+					pending:      make(map[int]*chunkFetch),
+				}
+				if err := cached.finalizeLocked(ctx); err != nil {
+					_ = file.Close()
+					return nil, err
+				}
+				return cached, nil
+			}
 		} else {
 			_ = os.Remove(progressPath)
+			progressExists = false
 		}
+	}
+	if !progressExists {
+		if store != nil {
+			if err := store.UpdateChunks(ctx, source.MediaSourceID, nil); err != nil {
+				return nil, err
+			}
+		}
+		chunks = NewBitset(chunkCount)
 	}
 
 	file, err := os.OpenFile(progressPath, os.O_CREATE|os.O_RDWR, 0o644)
@@ -175,6 +214,7 @@ func (f *CachedFile) WriteChunk(ctx context.Context, index int, data []byte) err
 	}
 	f.chunks.Set(index, true)
 	if f.chunks.Complete() {
+		fmt.Printf("[StreamCache] cache complete mediaSource=%s chunks=%d\n", f.source.MediaSourceID, f.chunks.Size())
 		return f.finalizeLocked(ctx)
 	}
 	if time.Since(f.lastChunkStateSave) >= chunkStateSaveInterval {
@@ -196,6 +236,40 @@ func (f *CachedFile) AwaitOrClaim(index int) (*chunkFetch, bool) {
 	pending := &chunkFetch{done: make(chan struct{})}
 	f.pending[index] = pending
 	return pending, true
+}
+
+func (f *CachedFile) AwaitChunk(index int) *chunkFetch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.chunks.Get(index) {
+		return nil
+	}
+	return f.pending[index]
+}
+
+func (f *CachedFile) ClaimNextMissingFrom(index int) (int, *chunkFetch, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for i := index; i < f.chunks.Size(); i++ {
+		if f.chunks.Get(i) {
+			continue
+		}
+		if _, ok := f.pending[i]; ok {
+			continue
+		}
+		pending := &chunkFetch{done: make(chan struct{})}
+		f.pending[i] = pending
+		return i, pending, true
+	}
+	return 0, nil, false
+}
+
+func (f *CachedFile) PendingCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pending)
 }
 
 func (f *CachedFile) CompleteFetch(index int, pending *chunkFetch, err error) {
@@ -233,7 +307,17 @@ func (f *CachedFile) finalizeLocked(ctx context.Context) error {
 	if err := os.Rename(f.progressPath, f.path); err != nil {
 		return err
 	}
+	finalFile, err := os.OpenFile(f.path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.file.Close(); err != nil {
+		_ = finalFile.Close()
+		return err
+	}
+	f.file = finalFile
 	f.finalized = true
+	fmt.Printf("[StreamCache] cache finalized mediaSource=%s path=%q\n", f.source.MediaSourceID, f.path)
 	return nil
 }
 

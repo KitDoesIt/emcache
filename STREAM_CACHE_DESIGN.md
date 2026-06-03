@@ -240,7 +240,9 @@ Validation:
 - Accept upstream `200 OK` only for `bytes=0-` if the length matches the expected media size.
 - If upstream size differs from the stored media source size, abort cache use and pass through when possible.
 
-Initial prefetch policy should be conservative: fetch sequentially from the first missing requested chunk and stop when the client disconnects. Later, allow background prefetch for a bounded number of chunks.
+Active fill policy should prioritize the client's current requested position. When the client reaches a missing chunk, start upstream fill from that chunk immediately, then continue sequentially into later chunks as fast as upstream and disk allow. Downstream reads should wait only for the chunk currently needed by the client; upstream fill may keep running ahead and cache the rest of the file before the client consumes it.
+
+If the client seeks to another missing position while an older fill is still running elsewhere, the requested position should win. The cache may start or move fill work to that chunk rather than forcing the client to wait for earlier background fill to catch up.
 
 Fetch scheduling should account for session class:
 
