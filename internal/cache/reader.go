@@ -360,10 +360,20 @@ func validateContentRangeStart(header string, start, total int64) error {
 	return nil
 }
 
-func readExactly(ctx context.Context, reader io.Reader, size int64, progress *fillProgress) ([]byte, error) {
+func readExactly(ctx context.Context, reader io.ReadCloser, size int64, progress *fillProgress) ([]byte, error) {
 	if size > int64(int(size)) {
 		return nil, fmt.Errorf("read size %d overflows int", size)
 	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = reader.Close()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
 	data := make([]byte, int(size))
 	read := 0
 	for read < len(data) {

@@ -74,7 +74,9 @@ func (g *DownloadGate) WaitDownloadTurn(ctx context.Context) (func(), error) {
 			}
 			continue
 		}
-		g.cond.Wait()
+		if err := g.waitOrContext(ctx, 0); err != nil {
+			return nil, err
+		}
 	}
 }
 
@@ -101,7 +103,9 @@ func (g *DownloadGate) WaitDownloadResumed(ctx context.Context) error {
 			}
 			continue
 		}
-		g.cond.Wait()
+		if err := g.waitOrContext(ctx, 0); err != nil {
+			return err
+		}
 	}
 }
 
@@ -113,6 +117,10 @@ func (g *DownloadGate) releaseDownloadTurn() {
 }
 
 func (g *DownloadGate) waitOrContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		g.cond.Wait()
+		return ctx.Err()
+	}
 	timer := time.AfterFunc(d, func() {
 		g.cond.L.Lock()
 		g.cond.Broadcast()

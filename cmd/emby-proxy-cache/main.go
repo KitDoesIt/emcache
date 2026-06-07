@@ -13,6 +13,7 @@ import (
 	"emby-proxy-cache/internal/interceptor"
 	"emby-proxy-cache/internal/proxy"
 	"emby-proxy-cache/internal/store"
+	"emby-proxy-cache/internal/upstream"
 )
 
 func main() {
@@ -30,7 +31,9 @@ func main() {
 	}
 	defer store.Close()
 
+	upstreamClient := upstream.NewClient()
 	cacheManager := cache.NewManager(cfg.StoragePath, cfg.UpstreamURL, store)
+	cacheManager.Client = upstreamClient
 	playbackEventLog := &interceptor.PlaybackEventLog{MaxSessions: cfg.MaxSessions}
 	chain := []interceptor.Interceptor{}
 	if cfg.EnableDownload {
@@ -43,7 +46,7 @@ func main() {
 		interceptor.Logger{},
 	)
 
-	handler := proxy.New(cfg.UpstreamURL, chain)
+	handler := proxy.NewWithClient(cfg.UpstreamURL, upstreamClient, chain)
 	server := &http.Server{
 		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler:           handler,

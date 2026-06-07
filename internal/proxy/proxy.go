@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"emby-proxy-cache/internal/interceptor"
+	"emby-proxy-cache/internal/upstream"
 )
 
 const copyBufferSize = 64 * 1024
@@ -22,20 +23,17 @@ type Proxy struct {
 	interceptors []interceptor.Interceptor
 }
 
-func New(upstream *url.URL, interceptors []interceptor.Interceptor) *Proxy {
-	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   64,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression:    true,
-	}
+func New(upstreamURL *url.URL, interceptors []interceptor.Interceptor) *Proxy {
+	return NewWithClient(upstreamURL, upstream.NewClient(), interceptors)
+}
 
+func NewWithClient(upstreamURL *url.URL, client *http.Client, interceptors []interceptor.Interceptor) *Proxy {
+	if client == nil {
+		client = upstream.NewClient()
+	}
 	return &Proxy{
-		upstream:     upstream,
-		client:       &http.Client{Transport: transport},
+		upstream:     upstreamURL,
+		client:       client,
 		interceptors: interceptors,
 	}
 }

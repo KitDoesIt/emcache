@@ -7,7 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestValidateContentRange(t *testing.T) {
@@ -86,6 +88,45 @@ func TestFetchSequentialWrapsToEarlierMissingChunkAndFinalizes(t *testing.T) {
 	}
 }
 
+func TestFetchSegmentCancelsBlockedBodyReadAndClearsPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	file := newTestCachedFile(t, ChunkSize)
+	pending, claimed := file.AwaitOrClaim(0)
+	if !claimed {
+		t.Fatal("claim chunk 0 failed")
+	}
+	body := &blockingBody{readCalled: make(chan struct{}), closed: make(chan struct{})}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := fetchSegment(ctx, file, 0, pending, FetchOptions{
+			Request:     &http.Request{Method: http.MethodGet, Header: make(http.Header)},
+			UpstreamURL: mustURL(t, "http://upstream/video.mkv"),
+			Client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return partialResponseWithBody(req, 0, ChunkSize-1, ChunkSize, body), nil
+			})},
+		})
+		done <- err
+	}()
+
+	body.waitForRead(t)
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected canceled fetch error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fetch did not return after context cancellation")
+	}
+	if file.PendingCount() != 0 {
+		t.Fatalf("pending count = %d, want 0", file.PendingCount())
+	}
+	if file.ChunkComplete(0) {
+		t.Fatal("canceled chunk was marked complete")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -112,14 +153,47 @@ func mustURL(t *testing.T, raw string) *url.URL {
 }
 
 func partialResponse(req *http.Request, start, end, total int64, body []byte) *http.Response {
+	return partialResponseWithBody(req, start, end, total, io.NopCloser(bytes.NewReader(body)))
+}
+
+func partialResponseWithBody(req *http.Request, start, end, total int64, body io.ReadCloser) *http.Response {
 	return &http.Response{
 		StatusCode: http.StatusPartialContent,
 		Header: http.Header{
-			"Content-Range":  []string{fmt.Sprintf("bytes %d-%d/%d", start, end, total)},
-			"Content-Length": []string{fmt.Sprintf("%d", len(body))},
+			"Content-Range": []string{fmt.Sprintf("bytes %d-%d/%d", start, end, total)},
 		},
-		Body:    io.NopCloser(bytes.NewReader(body)),
+		Body:    body,
 		Request: req,
+	}
+}
+
+type blockingBody struct {
+	once       sync.Once
+	readCalled chan struct{}
+	closed     chan struct{}
+}
+
+func (b *blockingBody) Read([]byte) (int, error) {
+	b.once.Do(func() { close(b.readCalled) })
+	<-b.closed
+	return 0, context.Canceled
+}
+
+func (b *blockingBody) Close() error {
+	select {
+	case <-b.closed:
+	default:
+		close(b.closed)
+	}
+	return nil
+}
+
+func (b *blockingBody) waitForRead(t *testing.T) {
+	t.Helper()
+	select {
+	case <-b.readCalled:
+	case <-time.After(time.Second):
+		t.Fatal("body read did not start")
 	}
 }
 
