@@ -38,11 +38,18 @@ type rangeReader struct {
 	once    sync.Once
 	fillMu  sync.Mutex
 	filling bool
+	fill    *activeFill
 	start   int64
 	end     int64
 	offset  int64
 	current *bytes.Reader
 	closed  bool
+}
+
+type activeFill struct {
+	index   int
+	pending *chunkFetch
+	cancel  context.CancelFunc
 }
 
 func (f *CachedFile) ReadRange(ctx context.Context, start, end int64, fetch FetchOptions) (io.ReadCloser, error) {
@@ -161,20 +168,22 @@ func (r *rangeReader) ensureChunk(index int) error {
 }
 
 func (r *rangeReader) fetchCurrentChunk(index int, pending *chunkFetch) error {
-	r.fillMu.Lock()
-	if r.filling {
-		r.fillMu.Unlock()
-		filePending := r.file.AwaitChunk(index)
-		if filePending == pending {
-			select {
-			case <-r.ctx.Done():
-				return r.ctx.Err()
-			case <-pending.done:
-				return pending.err
-			}
+	if r.waitIfSameFill(index, pending) {
+		select {
+		case <-r.ctx.Done():
+			return r.ctx.Err()
+		case <-pending.done:
+			return pending.err
 		}
-		return nil
 	}
+	if canceled := r.cancelReadahead(index); canceled != nil {
+		select {
+		case <-r.ctx.Done():
+			return r.ctx.Err()
+		case <-canceled.done:
+		}
+	}
+	r.fillMu.Lock()
 	r.filling = true
 	r.fillMu.Unlock()
 
@@ -192,9 +201,28 @@ func (r *rangeReader) fetchCurrentChunk(index int, pending *chunkFetch) error {
 	}
 }
 
+func (r *rangeReader) cancelReadahead(requestedIndex int) *chunkFetch {
+	r.fillMu.Lock()
+	defer r.fillMu.Unlock()
+	fill := r.fill
+	if fill != nil && fill.index != requestedIndex {
+		r.fill = nil
+		fill.cancel()
+		fmt.Printf("[StreamCache] preempt readahead mediaSource=%s fromChunk=%d requestedChunk=%d\n", r.file.Source().MediaSourceID, fill.index, requestedIndex)
+		return fill.pending
+	}
+	return nil
+}
+
+func (r *rangeReader) waitIfSameFill(index int, pending *chunkFetch) bool {
+	r.fillMu.Lock()
+	defer r.fillMu.Unlock()
+	return r.fill != nil && r.fill.index == index && r.fill.pending == pending
+}
+
 func (r *rangeReader) startFillFromNextMissing(index int) {
 	r.fillMu.Lock()
-	if r.filling {
+	if r.filling || r.fill != nil {
 		r.fillMu.Unlock()
 		return
 	}
@@ -203,14 +231,17 @@ func (r *rangeReader) startFillFromNextMissing(index int) {
 		r.fillMu.Unlock()
 		return
 	}
-	r.filling = true
+	fillCtx, cancel := context.WithCancel(r.ctx)
+	r.fill = &activeFill{index: missingIndex, pending: pending, cancel: cancel}
 	r.fillMu.Unlock()
 
 	fmt.Printf("[StreamCache] fill readahead mediaSource=%s fromChunk=%d requestedChunk=%d\n", r.file.Source().MediaSourceID, missingIndex, index)
 	go func() {
-		fetchFromChunk(r.ctx, r.file, missingIndex, pending, r.fetch)
+		fetchFromChunk(fillCtx, r.file, missingIndex, pending, r.fetch)
 		r.fillMu.Lock()
-		r.filling = false
+		if r.fill != nil && r.fill.index == missingIndex && r.fill.pending == pending {
+			r.fill = nil
+		}
 		r.fillMu.Unlock()
 	}()
 }

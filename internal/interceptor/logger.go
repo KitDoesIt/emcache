@@ -3,6 +3,7 @@ package interceptor
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -53,8 +54,8 @@ func LogStreamProgress(path string, pushed int64, socketWritten int64, drains in
 }
 
 func isStreamResponse(response *http.Response) bool {
-	contentType := response.Header.Get("Content-Type")
-	return response.StatusCode == http.StatusPartialContent ||
-		len(contentType) >= len("video/") && contentType[:len("video/")] == "video/" ||
+	contentType := strings.ToLower(strings.TrimSpace(response.Header.Get("Content-Type")))
+	contentType, _, _ = strings.Cut(contentType, ";")
+	return strings.HasPrefix(contentType, "video/") ||
 		contentType == "application/octet-stream"
 }

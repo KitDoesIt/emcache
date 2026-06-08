@@ -127,6 +127,77 @@ func TestFetchSegmentCancelsBlockedBodyReadAndClearsPending(t *testing.T) {
 	}
 }
 
+func TestActiveReadCanFetchCurrentChunkDuringReadahead(t *testing.T) {
+	ctx := context.Background()
+	file := newTestCachedFile(t, ChunkSize*3)
+	if err := file.WriteChunk(ctx, 0, chunkBytes(0, ChunkSize)); err != nil {
+		t.Fatalf("write chunk 0: %v", err)
+	}
+	pendingChunk1, claimed := file.AwaitOrClaim(1)
+	if !claimed {
+		t.Fatal("claim chunk 1 failed")
+	}
+
+	chunk2ReadStarted := make(chan struct{})
+	chunk2Closed := make(chan struct{})
+	chunk1Requested := make(chan struct{})
+	chunk1StartedBeforeChunk2Closed := false
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Header.Get("Range") {
+		case fmt.Sprintf("bytes=%d-", ChunkSize):
+			select {
+			case <-chunk2Closed:
+			default:
+				chunk1StartedBeforeChunk2Closed = true
+			}
+			close(chunk1Requested)
+			return partialResponse(req, ChunkSize, ChunkSize*3-1, ChunkSize*3, append(chunkBytes(1, ChunkSize), chunkBytes(2, ChunkSize)...)), nil
+		case fmt.Sprintf("bytes=%d-", ChunkSize*2):
+			return partialResponseWithBody(req, ChunkSize*2, ChunkSize*3-1, ChunkSize*3, &blockingBody{readCalled: chunk2ReadStarted, closed: chunk2Closed}), nil
+		default:
+			return nil, fmt.Errorf("unexpected range %s", req.Header.Get("Range"))
+		}
+	})}
+
+	reader, err := file.ReadRange(ctx, 0, ChunkSize*3-1, FetchOptions{
+		Class:       SessionActive,
+		Request:     &http.Request{Method: http.MethodGet, Header: make(http.Header)},
+		UpstreamURL: mustURL(t, "http://upstream/video.mkv"),
+		Client:      client,
+	})
+	if err != nil {
+		t.Fatalf("read range: %v", err)
+	}
+	defer reader.Close()
+
+	buf := make([]byte, 1)
+	if _, err := reader.Read(buf); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	select {
+	case <-chunk2ReadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("readahead fetch did not start")
+	}
+	file.CompleteFetch(1, pendingChunk1, context.Canceled)
+
+	if _, err := reader.Read(make([]byte, ChunkSize-1)); err != nil {
+		t.Fatalf("read rest of first chunk: %v", err)
+	}
+	if _, err := reader.Read(buf); err != nil {
+		t.Fatalf("read current chunk: %v", err)
+	}
+	select {
+	case <-chunk1Requested:
+	case <-time.After(time.Second):
+		t.Fatal("current chunk did not fetch while readahead was blocked")
+	}
+	if chunk1StartedBeforeChunk2Closed {
+		t.Fatal("current chunk fetch started before readahead upstream closed")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

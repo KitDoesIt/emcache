@@ -45,7 +45,6 @@ func (s StreamCache) OnRequest(ctx *Context) (*http.Response, bool, error) {
 		}
 		return nil, false, err
 	}
-
 	start, end, err := parseByteRange(rangeHeader, handle.Source.Size)
 	if err != nil {
 		_ = handle.Close()

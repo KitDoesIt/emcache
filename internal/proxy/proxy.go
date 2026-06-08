@@ -9,13 +9,19 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"emby-proxy-cache/internal/interceptor"
 	"emby-proxy-cache/internal/upstream"
 )
 
-const copyBufferSize = 64 * 1024
+const (
+	copyBufferSize = 64 * 1024
+	flushBytes     = 1024 * 1024
+	flushInterval  = 250 * time.Millisecond
+	writeStall     = 3 * time.Second
+)
 
 type Proxy struct {
 	upstream     *url.URL
@@ -119,12 +125,12 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, response *
 		return
 	}
 
-	counter := &countingWriter{writer: w}
 	buf := make([]byte, copyBufferSize)
 	started := time.Now()
 	lastLog := int64(0)
 	nextLog := int64(16 * 1024 * 1024)
 	isStream := isStreamResponse(response)
+	counter := newCountingWriter(w, r.URL.Path, isStream)
 
 	reader := &progressReader{
 		reader: response.Body,
@@ -138,6 +144,7 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, response *
 	}
 
 	_, err := io.CopyBuffer(counter, reader, buf)
+	counter.Flush()
 	if err != nil && !isClientGone(err) && !errors.Is(r.Context().Err(), context.Canceled) {
 		fmt.Printf("[HTTP] stream error %s after=%dB: %v\n", r.URL.Path, counter.written, err)
 	}
@@ -193,17 +200,48 @@ func joinPath(base, path string) string {
 }
 
 type countingWriter struct {
-	writer  io.Writer
-	written int64
+	writer    io.Writer
+	flusher   http.Flusher
+	path      string
+	isStream  bool
+	written   int64
+	unflushed int64
+	lastFlush time.Time
+}
+
+func newCountingWriter(writer io.Writer, path string, isStream bool) *countingWriter {
+	flusher, _ := writer.(http.Flusher)
+	return &countingWriter{writer: writer, flusher: flusher, path: path, isStream: isStream, lastFlush: time.Now()}
 }
 
 func (w *countingWriter) Write(p []byte) (int, error) {
+	started := time.Now()
+	var stalled atomic.Bool
+	timer := time.AfterFunc(writeStall, func() {
+		stalled.Store(true)
+		if w.isStream {
+			fmt.Printf("[HTTP] stream write stalled %s wrote=%dB pending=%dB stall=%s\n", w.path, w.written, len(p), writeStall)
+		}
+	})
 	n, err := w.writer.Write(p)
+	if !timer.Stop() && stalled.Load() && w.isStream {
+		fmt.Printf("[HTTP] stream write resumed %s wrote=%dB after=%s err=%v\n", w.path, w.written+int64(n), time.Since(started).Round(time.Millisecond), err)
+	}
 	w.written += int64(n)
-	if flusher, ok := w.writer.(http.Flusher); ok {
-		flusher.Flush()
+	w.unflushed += int64(n)
+	if w.flusher != nil && (w.unflushed >= flushBytes || time.Since(w.lastFlush) >= flushInterval) {
+		w.Flush()
 	}
 	return n, err
+}
+
+func (w *countingWriter) Flush() {
+	if w.flusher == nil || w.unflushed == 0 {
+		return
+	}
+	w.flusher.Flush()
+	w.unflushed = 0
+	w.lastFlush = time.Now()
 }
 
 type progressReader struct {
@@ -222,9 +260,9 @@ func (r *progressReader) Read(p []byte) (int, error) {
 }
 
 func isStreamResponse(response *http.Response) bool {
-	contentType := response.Header.Get("Content-Type")
-	return response.StatusCode == http.StatusPartialContent ||
-		strings.HasPrefix(contentType, "video/") ||
+	contentType := strings.ToLower(strings.TrimSpace(response.Header.Get("Content-Type")))
+	contentType, _, _ = strings.Cut(contentType, ";")
+	return strings.HasPrefix(contentType, "video/") ||
 		contentType == "application/octet-stream"
 }
 
