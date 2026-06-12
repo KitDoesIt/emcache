@@ -13,6 +13,7 @@ type Config struct {
 	StoragePath    string
 	MaxSessions    int
 	EnableDownload bool
+	CleanupDays    int
 }
 
 func Load() (Config, error) {
@@ -30,6 +31,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	cleanupDays, err := strconv.Atoi(getenv("CLEANUP_DAYS", "0"))
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		UpstreamURL:    upstreamURL,
@@ -38,6 +43,7 @@ func Load() (Config, error) {
 		StoragePath:    getenv("STORAGE_PATH", "./storage"),
 		MaxSessions:    maxSessions,
 		EnableDownload: os.Getenv("ENABLE_DOWNLOAD") == "1",
+		CleanupDays:    cleanupDays,
 	}, nil
 }
 

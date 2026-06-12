@@ -34,6 +34,7 @@ func main() {
 	upstreamClient := upstream.NewClient()
 	cacheManager := cache.NewManager(cfg.StoragePath, cfg.UpstreamURL, store)
 	cacheManager.Client = upstreamClient
+	cacheManager.StartDailyCleanup(context.Background(), cfg.CleanupDays)
 	playbackEventLog := &interceptor.PlaybackEventLog{MaxSessions: cfg.MaxSessions}
 	chain := []interceptor.Interceptor{}
 	if cfg.EnableDownload {
@@ -56,6 +57,9 @@ func main() {
 	log.Printf("Emby Proxy running on http://%s:%d", cfg.Host, cfg.Port)
 	log.Printf("Upstream: %s", cfg.UpstreamURL.String())
 	log.Printf("Storage: %s", cfg.StoragePath)
+	if cfg.CleanupDays > 0 {
+		log.Printf("Cleanup: deleting files older than %d days", cfg.CleanupDays)
+	}
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)

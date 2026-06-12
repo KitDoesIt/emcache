@@ -2,9 +2,13 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
 
 	"emby-proxy-cache/internal/store"
 )
@@ -24,6 +28,10 @@ type Manager struct {
 
 	mu    sync.Mutex
 	files map[string]*openFile
+
+	cleanupDone chan struct{}
+	opening     int
+	openingIdle chan struct{}
 }
 
 type openFile struct {
@@ -63,6 +71,11 @@ func (m *Manager) OpenPreferredByItemID(ctx context.Context, itemID string) (*Ha
 }
 
 func (m *Manager) open(ctx context.Context, initialKey string, load func() (string, store.MediaSource, bool, error)) (*Handle, error) {
+	if err := m.beginOpen(ctx); err != nil {
+		return nil, err
+	}
+	defer m.endOpen()
+
 	if initialKey != "" {
 		m.mu.Lock()
 		if item, ok := m.files[initialKey]; ok {
@@ -116,6 +129,154 @@ func (m *Manager) open(ctx context.Context, initialKey string, load func() (stri
 	handle := &Handle{Source: source, File: file}
 	handle.done = func() error { return m.release(context.Background(), key) }
 	return handle, nil
+}
+
+func (m *Manager) StartDailyCleanup(ctx context.Context, retentionDays int) {
+	if retentionDays <= 0 {
+		return
+	}
+	go func() {
+		m.cleanupOldFiles(ctx, retentionDays)
+
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.cleanupOldFiles(ctx, retentionDays)
+			}
+		}
+	}()
+}
+
+func (m *Manager) cleanupOldFiles(ctx context.Context, retentionDays int) {
+	if retentionDays <= 0 {
+		return
+	}
+	openPaths, finish, err := m.beginCleanup(ctx)
+	if err != nil {
+		return
+	}
+	defer finish()
+
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	if err := filepath.WalkDir(m.StoragePath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			fmt.Printf("[CacheCleanup] skip path=%q err=%v\n", path, err)
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if skipCleanupPath(path) || openPaths[path] {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			fmt.Printf("[CacheCleanup] stat path=%q err=%v\n", path, err)
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			fmt.Printf("[CacheCleanup] remove path=%q err=%v\n", path, err)
+		}
+		return nil
+	}); err != nil {
+		fmt.Printf("[CacheCleanup] walk storage=%q err=%v\n", m.StoragePath, err)
+	}
+}
+
+func (m *Manager) beginOpen(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		if m.cleanupDone == nil {
+			m.opening++
+			m.mu.Unlock()
+			return nil
+		}
+		done := m.cleanupDone
+		m.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+	}
+}
+
+func (m *Manager) endOpen() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.opening--
+	if m.opening == 0 && m.openingIdle != nil {
+		close(m.openingIdle)
+		m.openingIdle = nil
+	}
+}
+
+func (m *Manager) beginCleanup(ctx context.Context) (map[string]bool, func(), error) {
+	for {
+		m.mu.Lock()
+		if m.cleanupDone == nil {
+			m.cleanupDone = make(chan struct{})
+			break
+		}
+		done := m.cleanupDone
+		m.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-done:
+		}
+	}
+
+	for m.opening > 0 {
+		if m.openingIdle == nil {
+			m.openingIdle = make(chan struct{})
+		}
+		idle := m.openingIdle
+		m.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			m.finishCleanup()
+			return nil, nil, ctx.Err()
+		case <-idle:
+		}
+
+		m.mu.Lock()
+	}
+
+	openPaths := make(map[string]bool, len(m.files)*2)
+	for _, item := range m.files {
+		openPaths[item.file.path] = true
+		openPaths[item.file.progressPath] = true
+	}
+	m.mu.Unlock()
+
+	return openPaths, m.finishCleanup, nil
+}
+
+func (m *Manager) finishCleanup() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cleanupDone != nil {
+		close(m.cleanupDone)
+		m.cleanupDone = nil
+	}
+}
+
+func skipCleanupPath(path string) bool {
+	base := filepath.Base(path)
+	return base == "metadata.sqlite" || base == "metadata.sqlite-wal" || base == "metadata.sqlite-shm"
 }
 
 func (h *Handle) Close() error {
