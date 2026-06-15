@@ -176,21 +176,13 @@ func (u *Upstream) buildURL(base *url.URL, requestURL *url.URL) *url.URL {
 
 func copyHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if isHopHeader(key) {
+		switch key {
+		case "Connection", "Transfer-Encoding", "Keep-Alive",
+			"Proxy-Authenticate", "Proxy-Authorization", "TE", "Trailer", "Upgrade":
 			continue
 		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
+		dst[key] = append(dst[key], values...)
 	}
-}
-
-func isHopHeader(key string) bool {
-	switch key {
-	case "Connection", "Transfer-Encoding", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "TE", "Trailer", "Upgrade":
-		return true
-	}
-	return false
 }
 
 func isNetworkError(err error) bool {

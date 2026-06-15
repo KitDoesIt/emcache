@@ -9,19 +9,14 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"encache/internal/interceptor"
-	"encache/internal/logging"
 	"encache/internal/upstream"
 )
 
 const (
 	copyBufferSize = 64 * 1024
-	flushBytes     = 1024 * 1024
-	flushInterval  = 250 * time.Millisecond
-	writeStall     = 3 * time.Second
 )
 
 type Proxy struct {
@@ -63,10 +58,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !handled {
-		request := ctx.Request
-		upstreamURL = p.upstream.BuildURL(request.URL, false)
-		ctx.UpstreamURL = upstreamURL.String()
-		response, err = p.forward(request, false)
+		response, err = p.forward(ctx.Request, false)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -97,24 +89,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) forward(r *http.Request, isFallback bool) (*http.Response, error) {
-	if isFallback {
-		return p.upstream.DoFallback(r.Context(), &upstream.Request{
-			Method:        r.Method,
-			URL:           r.URL,
-			Body:          r.Body,
-			GetBody:       r.GetBody,
-			Header:        r.Header,
-			ContentLength: r.ContentLength,
-		})
-	}
-	return p.upstream.Do(r.Context(), &upstream.Request{
+	req := &upstream.Request{
 		Method:        r.Method,
 		URL:           r.URL,
 		Body:          r.Body,
 		GetBody:       r.GetBody,
 		Header:        r.Header,
 		ContentLength: r.ContentLength,
-	})
+	}
+	if isFallback {
+		return p.upstream.DoFallback(r.Context(), req)
+	}
+	return p.upstream.Do(r.Context(), req)
 }
 
 func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, response *http.Response) {
@@ -132,59 +118,54 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, r *http.Request, response *
 		return
 	}
 
+	isStream := isStreamResponse(response)
+	if !isStream {
+		buf := make([]byte, copyBufferSize)
+		written, err := io.CopyBuffer(w, response.Body, buf)
+		if err != nil && !isClientGone(err) && !errors.Is(r.Context().Err(), context.Canceled) {
+			fmt.Printf("[HTTP] write error %s after=%dB: %v\n", r.URL.Path, written, err)
+		}
+		return
+	}
+
+	// Video/octet-stream response — track progress for logging
 	buf := make([]byte, copyBufferSize)
 	started := time.Now()
-	lastLog := int64(0)
 	nextLog := int64(16 * 1024 * 1024)
-	isStream := isStreamResponse(response)
-	counter := newCountingWriter(w, r.URL.Path, isStream)
 
 	reader := &progressReader{
 		reader: response.Body,
 		onProgress: func(total int64) {
-			if isStream && total >= nextLog {
-				interceptor.LogStreamProgress(r.URL.Path, total, counter.written, 0, started)
-				lastLog = total
+			if total >= nextLog {
+				interceptor.LogStreamProgress(r.URL.Path, total, total, 0, started)
 				nextLog += 32 * 1024 * 1024
 			}
 		},
 	}
 
-	_, err := io.CopyBuffer(counter, reader, buf)
-	counter.Flush()
+	written, err := io.CopyBuffer(w, reader, buf)
 	if err != nil && !isClientGone(err) && !errors.Is(r.Context().Err(), context.Canceled) {
-		fmt.Printf("[HTTP] stream error %s after=%dB: %v\n", r.URL.Path, counter.written, err)
+		fmt.Printf("[HTTP] stream error %s after=%dB: %v\n", r.URL.Path, written, err)
 	}
 
-	if isStream {
-		fmt.Printf(
-			"[HTTP] stream done %s pushed=%dB wrote=%dB in %.2fs%s\n",
-			r.URL.Path,
-			reader.total,
-			counter.written,
-			time.Since(started).Seconds(),
-			finishNote(r.Context().Err(), lastLog),
-		)
-	}
+	fmt.Printf(
+		"[HTTP] stream done %s pushed=%dB wrote=%dB in %.2fs%s\n",
+		r.URL.Path,
+		reader.total,
+		written,
+		time.Since(started).Seconds(),
+		finishNote(r.Context().Err()),
+	)
 }
 
 func copyResponseHeaders(dst, src http.Header) {
 	for key, values := range src {
-		if isHopHeader(key) {
+		switch key {
+		case "Connection", "Transfer-Encoding", "Keep-Alive",
+			"Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Upgrade":
 			continue
 		}
-		for _, value := range values {
-			dst.Add(key, value)
-		}
-	}
-}
-
-func isHopHeader(key string) bool {
-	switch strings.ToLower(key) {
-	case "connection", "transfer-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade":
-		return true
-	default:
-		return false
+		dst[key] = append(dst[key], values...)
 	}
 }
 
@@ -213,56 +194,11 @@ func isClientGone(err error) bool {
 		strings.Contains(message, "client disconnected")
 }
 
-func finishNote(err error, lastLog int64) string {
+func finishNote(err error) string {
 	if err == nil {
 		return ""
 	}
 	return " canceled"
-}
-
-type countingWriter struct {
-	writer    io.Writer
-	flusher   http.Flusher
-	path      string
-	isStream  bool
-	written   int64
-	unflushed int64
-	lastFlush time.Time
-}
-
-func newCountingWriter(writer io.Writer, path string, isStream bool) *countingWriter {
-	flusher, _ := writer.(http.Flusher)
-	return &countingWriter{writer: writer, flusher: flusher, path: path, isStream: isStream, lastFlush: time.Now()}
-}
-
-func (w *countingWriter) Write(p []byte) (int, error) {
-	started := time.Now()
-	var stalled atomic.Bool
-	timer := time.AfterFunc(writeStall, func() {
-		stalled.Store(true)
-		if w.isStream {
-			logging.Verbosef("[HTTP] stream write stalled %s wrote=%dB pending=%dB stall=%s\n", w.path, w.written, len(p), writeStall)
-		}
-	})
-	n, err := w.writer.Write(p)
-	if !timer.Stop() && stalled.Load() && w.isStream {
-		logging.Verbosef("[HTTP] stream write resumed %s wrote=%dB after=%s err=%v\n", w.path, w.written+int64(n), time.Since(started).Round(time.Millisecond), err)
-	}
-	w.written += int64(n)
-	w.unflushed += int64(n)
-	if w.flusher != nil && (w.unflushed >= flushBytes || time.Since(w.lastFlush) >= flushInterval) {
-		w.Flush()
-	}
-	return n, err
-}
-
-func (w *countingWriter) Flush() {
-	if w.flusher == nil || w.unflushed == 0 {
-		return
-	}
-	w.flusher.Flush()
-	w.unflushed = 0
-	w.lastFlush = time.Now()
 }
 
 type progressReader struct {
