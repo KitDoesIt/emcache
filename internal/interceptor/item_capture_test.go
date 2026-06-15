@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"encache/internal/store"
 )
@@ -43,6 +44,12 @@ func TestItemCaptureCapturesUserItemEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("capture response: %v", err)
 	}
+
+	// Read body to EOF — this triggers the tee reader to capture
+	_, _ = io.ReadAll(response.Body)
+
+	// Allow background goroutine time to insert
+	time.Sleep(50 * time.Millisecond)
 
 	source, ok, err := metadata.GetMediaSource(context.Background(), "mediasource_279033")
 	if err != nil {
